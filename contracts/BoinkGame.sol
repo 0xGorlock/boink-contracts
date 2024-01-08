@@ -1,0 +1,351 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.20;
+
+/// @title Boink!
+/// @author gorlockthedev
+/// @notice This smart contract facilitates an on-chain PvP (Player versus Player) game called "Boink".
+/// @dev Players strive to be the last Boinker before the timer ends in this experimental, continuous round-based game.
+/// The game offers rewards in ETH, distributed automatically at the start of a new round.
+/// The contract handles the game logic, player interactions, and reward distributions.
+/// Disclaimer: This contract has not been optimized for gas efficiency and is experimental. Play at your own risk.
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
+
+/// @notice Interface for Boink Reward Staking
+interface IBoinkRewardStaking {
+    function depositRewards(uint256 amount) external;
+}
+
+/// @notice The main contract for the Boink game
+contract BoinkGame is ReentrancyGuard, Ownable {
+    IERC20 public paymentToken;
+    IERC721[] public beraNfts;
+    IBoinkRewardStaking public boinkStakingContract;
+
+    uint256 private constant DISCOUNT_PER_NFT = 10; // 10% discounts per NFT (should be in the wallet when `boinkIt` is called)
+    uint256 private constant MAX_DISCOUNT = 50; // cap the boink discount, no free lunch here
+    uint256 private constant MAX_NFTS_FOR_DISCOUNT = 5;
+
+    uint256 public gameDuration = 60 seconds;
+    uint256 public boinkCostIncreasePercent = 10; // increase boink cost by 10% per `boinkIt` function all
+    address public lastBoinker;
+    RoundWinner[] public roundWinners;
+
+    uint256 public totalBoinks;
+    uint256 public totalTokensUsed;
+    uint256 public totalRewardsWon;
+
+    uint256 public boinkCost;
+    uint256 public initialBoinkCost;
+
+    uint256 public currentRoundNumber;
+    uint256 public currentRoundBoinkCost;
+    uint256 public currentRoundPrizePool;
+    uint256 private currentRoundBoinkCount;
+
+    uint256 public lastBoinkTime;
+    uint256 public nextRoundPrizePool;
+
+    mapping(address => uint256) public boinkCount;
+    mapping(address => uint256) public nftOwnershipCount;
+    bool public isActive;
+    bool private initialized;
+
+    event Boinked(address indexed boinker, uint256 time);
+    event RewardsAdded(uint256 amount, address indexed depositor);
+    event GameStarted(uint256 timestamp);
+    event GameEnded(
+        address indexed winner,
+        uint256 prizeAmount,
+        uint256 roundNumber
+    );
+
+    struct RoundWinner {
+        address winner;
+        uint256 reward;
+        uint256 roundNumber;
+    }
+
+    constructor() {
+        isActive = false;
+        currentRoundNumber = 0;
+    }
+
+    modifier gameActive() {
+        require(isActive, "Game is not active");
+        _;
+    }
+
+    /// @notice Receives ETH and allocates it to the current or next round's prize pool
+    receive() external payable {
+        if (isActive && (lastBoinkTime + gameDuration > block.timestamp)) {
+            currentRoundPrizePool += msg.value;
+        } else {
+            nextRoundPrizePool += msg.value;
+        }
+        emit RewardsAdded(msg.value, msg.sender);
+    }
+
+    /// @notice Initializes the contract with necessary parameters
+    /// @param _paymentToken The address of the token used for boinking
+    /// @param _stakingContract The address of the staking contract for rewards
+    /// @param _initialBeraNfts An array of addresses for the initial set of Bera NFTs
+    /// @param _boinkCost The initial cost of boinking
+    function initialize(
+        address _paymentToken,
+        address _stakingContract,
+        IERC721[] calldata _initialBeraNfts,
+        uint256 _boinkCost
+    ) external onlyOwner {
+        require(!initialized, "Contract is already initialized");
+
+        require(_paymentToken != address(0), "Invalid payment token address");
+        paymentToken = IERC20(_paymentToken);
+
+        require(
+            _stakingContract != address(0),
+            "Invalid staking contract address"
+        );
+        boinkStakingContract = IBoinkRewardStaking(_stakingContract);
+
+        for (uint256 i = 0; i < _initialBeraNfts.length; i++) {
+            require(
+                address(_initialBeraNfts[i]) != address(0),
+                "Invalid Bera NFT address"
+            );
+            beraNfts.push(_initialBeraNfts[i]);
+        }
+
+        boinkCost = _boinkCost;
+        currentRoundBoinkCost = boinkCost;
+
+        initialized = true;
+    }
+
+/* INTERNAL */
+    /// @notice Checks and updates the game status based on time and active flag
+    function _checkGameStatus() internal {
+        if (
+            lastBoinkTime != 0 &&
+            block.timestamp > lastBoinkTime + gameDuration &&
+            isActive
+        ) {
+            uint256 prizeAmount = currentRoundPrizePool;
+            payable(lastBoinker).transfer(prizeAmount);
+            totalRewardsWon += prizeAmount;
+
+            emit GameEnded(lastBoinker, prizeAmount, currentRoundNumber);
+
+            roundWinners.push(
+                RoundWinner({
+                    winner: lastBoinker,
+                    reward: prizeAmount,
+                    roundNumber: currentRoundNumber
+                })
+            );
+
+            currentRoundPrizePool = nextRoundPrizePool;
+            nextRoundPrizePool = 0;
+
+            lastBoinker = address(0);
+
+            currentRoundNumber++;
+            currentRoundBoinkCost = boinkCost;
+            currentRoundBoinkCount = 0;
+            gameDuration = 60 seconds;
+            lastBoinkTime = 0;
+            isActive = true;
+        }
+    }
+
+    /// @notice Handles the token transfer and burning process for a Boink action
+    function _handleTokenTransferAndBurn() internal {
+        uint256 costBeforeDiscount = currentRoundBoinkCost;
+        uint256 totalDiscount = 0;
+
+        for (uint256 i = 0; i < beraNfts.length; i++) {
+            uint256 nftOwned = beraNfts[i].balanceOf(msg.sender);
+            totalDiscount += (nftOwned >= MAX_NFTS_FOR_DISCOUNT)
+                ? MAX_DISCOUNT
+                : nftOwned * DISCOUNT_PER_NFT;
+
+            if (totalDiscount >= MAX_DISCOUNT) {
+                totalDiscount = MAX_DISCOUNT;
+                break;
+            }
+        }
+
+        uint256 costAfterDiscount = costBeforeDiscount -
+            (costBeforeDiscount * totalDiscount) /
+            100;
+
+        require(
+            paymentToken.transferFrom(
+                msg.sender,
+                address(this),
+                costAfterDiscount
+            ),
+            "Transfer of tokens to contract failed"
+        );
+
+        uint256 halfCost = costAfterDiscount / 2;
+
+        require(
+            paymentToken.approve(address(boinkStakingContract), halfCost),
+            "Approval for token transfer failed"
+        );
+        boinkStakingContract.depositRewards(halfCost);
+
+        bool success = paymentToken.transfer(
+            0x000000000000000000000000000000000000dEaD,
+            halfCost
+        );
+        require(success, "Transfer of tokens to dead address failed");
+    }
+
+    /// @notice Validates if the Boink conditions are met before a player can boink
+    function _validateBoinkConditions() internal view {
+        require(isActive, "The game is not active");
+        require(msg.sender == tx.origin, "Sender cannot be a contract");
+
+        uint256 balance = paymentToken.balanceOf(msg.sender);
+        require(balance >= currentRoundBoinkCost, "Not enough $BOINK tokens");
+
+        uint256 allowance = paymentToken.allowance(msg.sender, address(this));
+        require(allowance >= currentRoundBoinkCost, "Insufficient allowance");
+    }
+
+    /// @notice Updates the game state after a Boink action
+    function _updateGameState() internal {
+        lastBoinker = msg.sender;
+
+        if (lastBoinkTime == 0 || currentRoundBoinkCount == 0) {
+            lastBoinkTime = block.timestamp;
+            currentRoundBoinkCount++;
+            emit Boinked(msg.sender, block.timestamp);
+            return;
+        }
+
+        currentRoundBoinkCost =
+            (currentRoundBoinkCost * (100 + boinkCostIncreasePercent)) /
+            100;
+
+        if (gameDuration > 10 seconds) {
+            gameDuration = gameDuration - 2 seconds;
+            lastBoinkTime = block.timestamp;
+        } else {
+            lastBoinkTime = block.timestamp - (gameDuration - 10 seconds);
+        }
+
+        currentRoundBoinkCount++;
+        boinkCount[msg.sender]++;
+        totalBoinks++;
+        totalTokensUsed += currentRoundBoinkCost;
+        emit Boinked(msg.sender, block.timestamp);
+    }
+
+/* EXTERNAL */
+    /// @notice Retrieves the current prize pool amount
+    /// @return The current amount in the prize pool
+    function getCurrentPrizePool() external view returns (uint256) {
+        return currentRoundPrizePool;
+    }
+
+    /// @notice Calculates the remaining time until the end of the current round
+    /// @return The time left in seconds for the current round
+    function timeUntilEnd() external view returns (uint256) {
+        if (lastBoinkTime == 0) {
+            return gameDuration;
+        }
+        uint256 timeElapsed = block.timestamp - lastBoinkTime;
+        return timeElapsed >= gameDuration ? 0 : gameDuration - timeElapsed;
+    }
+
+    /// @notice Provides the discount and NFT count for a given user based on Bera NFT ownership
+    /// @param user The address of the user to check for NFT discounts
+    /// @return discount The total discount percentage for the user
+    /// @return nftCount The total count of Bera NFTs owned by the user
+    function getUserNftDiscount(address user)
+        external
+        view
+        returns (uint256 discount, uint256 nftCount)
+    {
+        uint256 totalDiscount = 0;
+        uint256 totalNftCount = 0;
+
+        for (uint256 i = 0; i < beraNfts.length; i++) {
+            uint256 nftOwned = beraNfts[i].balanceOf(user);
+            totalNftCount += nftOwned;
+            totalDiscount += (nftOwned >= MAX_NFTS_FOR_DISCOUNT)
+                ? MAX_DISCOUNT
+                : nftOwned * DISCOUNT_PER_NFT;
+
+            if (totalDiscount >= MAX_DISCOUNT) {
+                totalDiscount = MAX_DISCOUNT;
+                break;
+            }
+        }
+
+        return (totalDiscount, totalNftCount);
+    }
+
+    /// @notice Adds new Bera NFT contracts to the game for discounts
+    /// @param _newBeraNfts Array of new Bera NFT contract addresses to add
+    function addBeraNftContract(IERC721[] calldata _newBeraNfts)
+        external
+        onlyOwner
+    {
+        for (uint256 i = 0; i < _newBeraNfts.length; i++) {
+            require(
+                address(_newBeraNfts[i]) != address(0),
+                "Invalid Bera NFT address"
+            );
+            beraNfts.push(_newBeraNfts[i]);
+        }
+    }
+
+    /// @notice Removes a Bera NFT contract from the game
+    /// @param index The index of the Bera NFT contract to remove
+    function removeBeraNftContract(uint256 index) external onlyOwner {
+        require(index < beraNfts.length, "Index out of bounds");
+        beraNfts[index] = beraNfts[beraNfts.length - 1];
+        beraNfts.pop();
+    }
+
+    /// @notice Allows any user to add funds to the prize pool
+    function addFundsToPrizePool() external payable {
+        require(msg.value > 0, "Amount should be greater than 0");
+        if (isActive && (lastBoinkTime + gameDuration > block.timestamp)) {
+            currentRoundPrizePool += msg.value;
+        } else {
+            nextRoundPrizePool += msg.value;
+        }
+        emit RewardsAdded(msg.value, msg.sender);
+    }
+
+    /// @notice Allows a player to Boink!
+    function boinkIt() external nonReentrant gameActive {
+        _checkGameStatus();
+        _validateBoinkConditions();
+        _handleTokenTransferAndBurn();
+        _updateGameState();
+    }
+
+    /// @notice Starts the game, making it active for players to participate. Once called, the game will run forever
+    function startGame() external onlyOwner {
+        require(
+            address(paymentToken) != address(0),
+            "PaymentToken must be set before starting the game"
+        );
+        require(!isActive, "Game is already active");
+        isActive = true;
+
+        currentRoundPrizePool += nextRoundPrizePool;
+        nextRoundPrizePool = 0;
+
+        emit GameStarted(block.timestamp);
+    }
+}
